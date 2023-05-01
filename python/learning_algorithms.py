@@ -36,7 +36,7 @@ class ACTrainer:
             for t in range(len(self.trajectory['reward'])):
                 avg_ro_reward = avg_ro_reward + np.sum(r for r in self.trajectory['reward'][t])
             avg_ro_reward = avg_ro_reward / self.params['n_trajectory_per_rollout']
-            print(f'End of rollout {ro_idx}: Average trajectory reward is {avg_ro_reward: 0.`2`f}')
+            print(f'End of rollout {ro_idx}: Average trajectory reward is {avg_ro_reward: 0.2f}')
             # Append average rollout reward into a list
             list_ro_reward.append(avg_ro_reward)
         # Save avg-rewards as pickle files
@@ -60,36 +60,41 @@ class ACTrainer:
     def update_target_value(self, gamma=0.99):
         # TODO: Update target values
         # HINT: Use definition of target-estimate from equation 7 of teh assignment PDF
+        target_value = list()
+        state_value = list()
 
-        next_state_value = torch.tensor([0.0], device=get_device())
-        target_value, _, _ = self.critic_net(torch.tensor(self.trajectory['next_state'], dtype=torch.float32, device=get_device()))
-        for t in reversed(range(self.params['n_trajectory_per_rollout'])):
-            if t == self.params['n_trajectory_per_rollout'] - 1:
-                next_state_value = target_value
-            target_value = self.trajectory['reward'][t] + gamma * next_state_value * self.trajectory['not_done'][t]
-            self.trajectory['target_value'][t] = target_value.detach().clone()
-            _, state_value, _ = self.critic_net(torch.tensor(self.trajectory['state'][t], dtype=torch.float32, device=get_device()))
-            self.trajectory['state_value'][t] = state_value.detach().clone()
-            next_state_value = state_value
-
-        # self.trajectory['state_value'] = ???
-        # self.trajectory['target_value'] = ???
+        for k in range(self.params['n_trajectory_per_rollout']):
+            target_value_for_trajectory = list()
+            state_value_for_trajectory = list()
+            for t in range(len(self.trajectory['reward'][k]) - 1):
+                reward_kt = self.trajectory['reward'][k][t]
+                current_state_value = self.critic_net(self.trajectory['obs'][k][t])
+                next_state_value = self.critic_net(self.trajectory['obs'][k][t+1])
+                target_value_for_trajectory.append(reward_kt + (gamma * next_state_value.item()))
+                state_value_for_trajectory.append(current_state_value.item())
+            target_value.append(target_value_for_trajectory)
+            state_value.append(state_value_for_trajectory)
+        self.trajectory['target_value'] = target_value
+        self.trajectory['state_value'] = state_value
 
     def estimate_advantage(self, gamma=0.99):
         # TODO: Estimate advantage
         # HINT: Use definition of advantage-estimate from equation 6 of teh assignment PDF
 
-        discounted_rewards = apply_discount(self.trajectory['reward'], gamma)
-        state_values = self.critic_net(torch.tensor(self.trajectory['state'], dtype=torch.float32, device=get_device()))
-        next_state_values = self.critic_net(torch.tensor(self.trajectory['next_state'], dtype=torch.float32, device=get_device()))
-        target_values = discounted_rewards + gamma * next_state_values * (1 - self.trajectory['done'])
-        advantage = target_values - state_values.detach()
+        advantage = list()
+        for k in range(self.params['n_trajectory_per_rollout']):
+            advantage_for_trajectory = list()
+            for t in range(len(self.trajectory['reward'][k]) - 1):
+                reward_kt = self.trajectory['reward'][k][t]
+                state_value = self.critic_net(self.trajectory['obs'][k][t])
+                next_state_value = self.critic_net(self.trajectory['obs'][k][t+1])
+                advantage_for_trajectory.append((reward_kt + (gamma * next_state_value.item())) - state_value.item())
+            advantage.append(advantage_for_trajectory)
         self.trajectory['advantage'] = advantage
-
-        # self.trajectory['advantage'] = ???
 
     def update_actor_net(self):
         actor_loss = self.estimate_actor_loss_function()
+        print(actor_loss)
         actor_loss.backward()
         self.actor_optimizer.step()
         self.actor_optimizer.zero_grad()
@@ -97,31 +102,25 @@ class ACTrainer:
     def estimate_critic_loss_function(self):
         # TODO: Compute critic loss function
         # HINT: Use definition of critic-loss from equation 7 of teh assignment PDF. It is the MSE between target-values and state-values.
-        # critic_loss = ???
-        
-        # Get the state value predictions from the critic network
-        state_value_pred = self.critic_net(torch.tensor(self.trajectory['state'], dtype=torch.float32, device=get_device()))
-
-        # Calculate the mean squared error between the target values and the predicted state values
-        critic_loss = nn.MSELoss()(state_value_pred.view(-1), torch.tensor(self.trajectory['target_value'], dtype=torch.float32, device=get_device()))
-
-        return critic_loss
+        critic_loss = torch.zeros(1, requires_grad=True)
+        for k in range(self.params['n_trajectory_per_rollout']):
+            trajectory_loss = torch.zeros(1)
+            step = len(self.trajectory['target_value'][k])
+            for t in range(step):
+                trajectory_loss = trajectory_loss + (self.trajectory['target_value'][k][t] - self.trajectory['state_value'][k][t]) ** 2
+            critic_loss = critic_loss + (trajectory_loss / step)
+        return critic_loss / self.params['n_trajectory_per_rollout']
+       
 
     def estimate_actor_loss_function(self):
         actor_loss = list()
         for t_idx in range(self.params['n_trajectory_per_rollout']):
-            log_prob = self.trajectory['log_prob'][t_idx]
             advantage = apply_discount(self.trajectory['advantage'][t_idx])
             # TODO: Compute actor loss function
             reward_for_trajectory = 0
-
-            for t in range(len(log_prob) - 1):
-                t_value = log_prob[t]
-
-                t_value = t_value * advantage[t]
-                reward_for_trajectory = reward_for_trajectory + t_value
-            
-            actor_loss.append( -1 * reward_for_trajectory )
+            for t in range(len(self.trajectory['advantage'][t_idx])):
+                reward_for_trajectory = reward_for_trajectory + (advantage[t] * self.trajectory['log_prob'][t_idx][t])
+            actor_loss.append(-1 * reward_for_trajectory)
         actor_loss = torch.stack(actor_loss).mean()
         return actor_loss
 
@@ -135,7 +134,6 @@ class ACTrainer:
                 break
         save_video(frames=self.env.render(), video_folder=self.params['env_name'][:-3], fps=self.env.metadata['render_fps'], step_starting_index=0, episode_index=0)
 
-
 # CLass for actor-net
 class ActorNet(nn.Module):
     def __init__(self, input_size, output_size, hidden_dim):
@@ -147,12 +145,11 @@ class ActorNet(nn.Module):
     def forward(self, obs):
         # TODO: Forward pass of actor net
         # HINT: (use Categorical from torch.distributions to draw samples and log-prob from model output)
-        action_probs = self.policy_net(obs)
-        probability_distribution = Categorical(action_probs)
+        action_probs = self.ff_net(obs)
+        probability_distribution = Categorical(logits=action_probs)
         action_index = probability_distribution.sample()
         log_prob = probability_distribution.log_prob(action_index)
         return action_index, log_prob
-
 
 # CLass for actor-net
 class CriticNet(nn.Module):
@@ -168,7 +165,6 @@ class CriticNet(nn.Module):
         # HINT: (get state value from the network using the current observation)
         state_value = torch.relu(self.ff_net(obs))
         return state_value
-
 
 # Class for agent
 class ACAgent:
@@ -208,7 +204,6 @@ class ACAgent:
             serialized_buffer['log_prob'].append(torch.stack(trajectory_buffer['log_prob']))
             serialized_buffer['reward'].append(trajectory_buffer['reward'])
         return serialized_buffer
-
 
 class DQNTrainer:
     def __init__(self, params):
@@ -255,8 +250,7 @@ class DQNTrainer:
         # TODO: Implement the epsilon-greedy behavior
         # HINT: The agent will will choose action based on maximum Q-value with
         # '1-ε' probability, and a random action with 'ε' probability.
-        # action = ???
-        # Implement the epsilon-greedy behavior
+    
         if np.random.uniform() < self.epsilon:
             # Choose a random action with probability epsilon
             action = self.env.action_space.sample()
@@ -266,7 +260,7 @@ class DQNTrainer:
                 state_value = self.q_net(torch.FloatTensor(obs).to(get_device()))
                 action = torch.argmax(state_value).item()
         return action
-
+    
     def update_q_net(self):
         if len(self.replay_memory.buffer) < self.params['batch_size']:
             return
@@ -274,21 +268,26 @@ class DQNTrainer:
         # HINT: You should draw a batch of random samples from the replay buffer
         # and train your Q-net with that sampled batch.
 
-        # predicted_state_value = ???
-        # target_value = ???
+        samples = self.replay_memory.sample(self.params['batch_size'])
 
-        state, action, reward, next_state, mask = self.replay_memory.sample(self.params['batch_size'])
-        state = torch.FloatTensor(state).to(get_device())
-        next_state = torch.FloatTensor(next_state).to(get_device())
-        action = torch.LongTensor(action).to(get_device())
-        reward = torch.FloatTensor(reward).to(get_device())
-        mask = torch.FloatTensor(mask).to(get_device())
-        # Compute the predicted Q-values
-        predicted_state_value = self.q_net(state).gather(1, action.unsqueeze(1)).squeeze(1)
-        # Compute the target Q-values using the target network
-        with torch.no_grad():
-            next_state_value = self.target_net(next_state)
-            target_value = reward + mask*self.params['gamma']*torch.max(next_state_value, dim=1)[0]
+        predicted_state_values = list()
+        target_values = list()
+
+        for idx in range(len(samples)):
+            if (samples[idx].not_done_batch) :
+                next_obs_reward = self.q_net(torch.tensor(samples[idx].next_obs_batch))
+                next_obs_reward = samples[idx].reward_batch + self.params['gamma'] * torch.max(next_obs_reward)
+            else:
+                next_obs_reward = samples[idx].reward_batch
+            
+            current_obs= self.target_net(torch.tensor(samples[idx].obs_batch))
+            current_action = current_obs[samples[idx].action_batch]
+
+            predicted_state_values.append(next_obs_reward)
+            target_values.append(current_action)
+        
+        predicted_state_value = torch.tensor(predicted_state_values, requires_grad= True)
+        target_value = torch.tensor(target_values, requires_grad=True)
 
         criterion = nn.SmoothL1Loss()
         q_loss = criterion(predicted_state_value, target_value.unsqueeze(1))
@@ -320,21 +319,20 @@ class DQNTrainer:
 class ReplayMemory:
     # TODO: Implement replay buffer
     # HINT: You can use python data structure deque to construct a replay buffer
+    # Reference: https://www.geeksforgeeks.org/namedtuple-in-python/#
     def __init__(self, capacity):
         self.capacity = capacity
+        self.sampletuple = namedtuple('sample',['obs_batch', 'action_batch', 'reward_batch', 'next_obs_batch', 'not_done_batch'])
         self.buffer = deque(maxlen =  capacity)
 
     def push(self, *args):
-        # for arg in args:
-        #     self.buffer.append(arg)
-        self.buffer.append(tuple(args))
+        self.buffer.append(self.sampletuple(*args))
 
     def sample(self, n_samples):
-        batch = random.sample(self.buffer, n_samples)
-        print(batch)
-        # print(len(batch))
-        obs_batch, action_batch, reward_batch, next_obs_batch, not_done_batch = map(np.stack, zip(*batch))
-        return obs_batch, action_batch, reward_batch, next_obs_batch, not_done_batch
+        sample_list = list()
+        for i in range(n_samples):
+            sample_list.append(self.buffer[random.randint(0, len(self.buffer)-1)])
+        return sample_list
 
 
 class QNet(nn.Module):
